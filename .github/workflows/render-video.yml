@@ -1,0 +1,98 @@
+name: Gerar video de produto
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: "URL da imagem do produto"
+        required: true
+        type: string
+
+      item_id:
+        description: "ID do produto"
+        required: true
+        default: "teste"
+        type: string
+
+  repository_dispatch:
+    types:
+      - render_product_video
+
+permissions:
+  contents: read
+
+jobs:
+  gerar-video:
+
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_URL: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.image_url || inputs.image_url }}
+      ITEM_ID: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_id || inputs.item_id }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+
+    steps:
+
+      - name: Preparar identificador
+        id: dados
+        shell: bash
+        run: |
+          SAFE_ID=$(echo "$ITEM_ID" | tr -cd '[:alnum:]_-')
+
+          if [ -z "$SAFE_ID" ]; then
+            SAFE_ID="produto"
+          fi
+
+          echo "safe_id=$SAFE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Baixar imagem do produto
+        shell: bash
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 2 \
+            --user-agent "Mozilla/5.0" \
+            "$IMAGE_URL" \
+            --output produto.jpg
+
+      - name: Verificar FFmpeg
+        shell: bash
+        run: |
+          ffmpeg -version
+
+      - name: Criar video vertical
+        shell: bash
+        run: |
+          ffmpeg \
+            -y \
+            -loop 1 \
+            -i produto.jpg \
+            -vf "scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:color=white,zoompan=z='min(zoom+0.0006,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=180:s=1080x1350:fps=30,format=yuv420p" \
+            -t 6 \
+            -c:v libx264 \
+            -preset medium \
+            -crf 20 \
+            -pix_fmt yuv420p \
+            -movflags +faststart \
+            "video-${{ steps.dados.outputs.safe_id }}.mp4"
+
+      - name: Guardar video de teste
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ steps.dados.outputs.safe_id }}
+          path: video-${{ steps.dados.outputs.safe_id }}.mp4
+          retention-days: 1
+
+      - name: Enviar video ao n8n
+        if: github.event_name == 'repository_dispatch' && env.CALLBACK_URL != ''
+        shell: bash
+        run: |
+          curl \
+            --fail \
+            --request POST \
+            --form "item_id=${{ steps.dados.outputs.safe_id }}" \
+            --form "video=@video-${{ steps.dados.outputs.safe_id }}.mp4;type=video/mp4" \
+            "$CALLBACK_URL"
