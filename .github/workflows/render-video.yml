@@ -1,4 +1,4 @@
-name: Gerar video de produto
+name: Gerar vídeo de produto
 
 on:
   workflow_dispatch:
@@ -7,7 +7,6 @@ on:
         description: "URL da imagem do produto"
         required: true
         type: string
-
       item_id:
         description: "ID do produto"
         required: true
@@ -23,76 +22,111 @@ permissions:
 
 jobs:
   gerar-video:
-
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     env:
-      IMAGE_URL: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.image_url || inputs.image_url }}
+      URL_DA_IMAGEM: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.image_url || inputs.image_url }}
       ITEM_ID: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_id || inputs.item_id }}
-      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      URL_DE_RETORNO: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.callback_url || '' }}
 
     steps:
+      - name: Set up job
+        run: echo "Iniciando workflow..."
 
       - name: Preparar identificador
-        id: dados
+        id: preparar
         shell: bash
         run: |
-          SAFE_ID=$(echo "$ITEM_ID" | tr -cd '[:alnum:]_-')
+          set -euo pipefail
 
-          if [ -z "$SAFE_ID" ]; then
-            SAFE_ID="produto"
+          IMAGE_URL="$(printf '%s' "${URL_DA_IMAGEM}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          IMAGE_URL="$(printf '%s' "$IMAGE_URL" | sed 's/^"//;s/"$//')"
+          IMAGE_URL="$(printf '%s' "$IMAGE_URL" | sed "s/^'//;s/'$//")"
+
+          ITEM="$(printf '%s' "${ITEM_ID}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          CALLBACK="$(printf '%s' "${URL_DE_RETORNO}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+          SAFE_ITEM="$(printf '%s' "$ITEM" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9._-]/-/g')"
+
+          if [ -z "$SAFE_ITEM" ]; then
+            SAFE_ITEM="produto"
           fi
 
-          echo "safe_id=$SAFE_ID" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URL=$IMAGE_URL" >> "$GITHUB_ENV"
+          echo "ITEM=$ITEM" >> "$GITHUB_ENV"
+          echo "SAFE_ITEM=$SAFE_ITEM" >> "$GITHUB_ENV"
+          echo "CALLBACK=$CALLBACK" >> "$GITHUB_ENV"
+
+          echo "safe_item=$SAFE_ITEM" >> "$GITHUB_OUTPUT"
+
+          echo "URL final: $IMAGE_URL"
+          echo "Item final: $ITEM"
 
       - name: Baixar imagem do produto
         shell: bash
         run: |
-          curl \
-            --fail \
-            --location \
-            --retry 3 \
-            --retry-delay 2 \
+          set -euo pipefail
+
+          echo "Baixando: $IMAGE_URL"
+
+          curl -L --fail --retry 3 --retry-delay 2 \
             --user-agent "Mozilla/5.0" \
             "$IMAGE_URL" \
             --output produto.jpg
 
+          test -s produto.jpg
+          file produto.jpg || true
+
       - name: Verificar FFmpeg
         shell: bash
         run: |
-          ffmpeg -version
+          set -euo pipefail
 
-      - name: Criar video vertical
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+          ffmpeg -version | head -n 1
+
+      - name: Criar vídeo vertical
         shell: bash
         run: |
-          ffmpeg \
-            -y \
-            -loop 1 \
-            -i produto.jpg \
-            -vf "scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:color=white,zoompan=z='min(zoom+0.0006,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=180:s=1080x1350:fps=30,format=yuv420p" \
-            -t 6 \
-            -c:v libx264 \
-            -preset medium \
-            -crf 20 \
-            -pix_fmt yuv420p \
-            -movflags +faststart \
-            "video-${{ steps.dados.outputs.safe_id }}.mp4"
+          set -euo pipefail
 
-      - name: Guardar video de teste
-        if: github.event_name == 'workflow_dispatch'
+          ffmpeg -y \
+            -loop 1 -i produto.jpg \
+            -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+            -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p" \
+            -r 30 \
+            -t 8 \
+            -c:v libx264 \
+            -pix_fmt yuv420p \
+            -c:a aac \
+            -shortest \
+            "video-${SAFE_ITEM}.mp4"
+
+          test -s "video-${SAFE_ITEM}.mp4"
+
+      - name: Guardar vídeo de teste
         uses: actions/upload-artifact@v4
         with:
-          name: video-${{ steps.dados.outputs.safe_id }}
-          path: video-${{ steps.dados.outputs.safe_id }}.mp4
-          retention-days: 1
+          name: video-${{ steps.preparar.outputs.safe_item }}
+          path: video-${{ steps.preparar.outputs.safe_item }}.mp4
+          if-no-files-found: error
 
-      - name: Enviar video ao n8n
-        if: github.event_name == 'repository_dispatch' && env.CALLBACK_URL != ''
+      - name: Enviar vídeo ao n8n
+        if: ${{ env.CALLBACK != '' }}
         shell: bash
         run: |
-          curl \
-            --fail \
-            --request POST \
-            --form "item_id=${{ steps.dados.outputs.safe_id }}" \
-            --form "video=@video-${{ steps.dados.outputs.safe_id }}.mp4;type=video/mp4" \
-            "$CALLBACK_URL"
+          set -euo pipefail
+
+          curl -L --fail \
+            -X POST "$CALLBACK" \
+            -F "item_id=$ITEM" \
+            -F "status=sucesso" \
+            -F "arquivo=@video-${SAFE_ITEM}.mp4;type=video/mp4"
+
+      - name: Complete job
+        run: echo "Workflow concluído com sucesso."
