@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_url:
-        description: "URL da imagem do produto"
+        description: "URL direta da imagem do produto, em boa resolução"
         required: true
         type: string
       item_id:
@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   gerar-video:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     env:
@@ -31,83 +31,141 @@ jobs:
       URL_DE_RETORNO: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.callback_url || '' }}
 
     steps:
-      - name: Set up job
-        run: echo "Iniciando workflow..."
-
-      - name: Preparar identificador
+      - name: Preparar dados
         id: preparar
         shell: bash
         run: |
           set -euo pipefail
 
-          IMAGE_URL="$(printf '%s' "${URL_DA_IMAGEM}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          IMAGE_URL="$(printf '%s' "$IMAGE_URL" | sed 's/^"//;s/"$//')"
-          IMAGE_URL="$(printf '%s' "$IMAGE_URL" | sed "s/^'//;s/'$//")"
+          python3 - <<'PY'
+          import os
+          import re
+          from urllib.parse import urlsplit
 
-          ITEM="$(printf '%s' "${ITEM_ID}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          CALLBACK="$(printf '%s' "${URL_DE_RETORNO}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          def limpar(valor):
+              return valor.replace('\r', '').replace('\n', '').strip().strip('"\'').strip()
 
-          SAFE_ITEM="$(printf '%s' "$ITEM" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9._-]/-/g')"
+          imagem = limpar(os.environ.get('URL_DA_IMAGEM', ''))
+          item = limpar(os.environ.get('ITEM_ID', '')) or 'produto'
+          retorno = limpar(os.environ.get('URL_DE_RETORNO', ''))
 
-          if [ -z "$SAFE_ITEM" ]; then
-            SAFE_ITEM="produto"
-          fi
+          for nome, url in [('imagem', imagem), ('retorno', retorno)]:
+              if nome == 'retorno' and not url:
+                  continue
+              partes = urlsplit(url)
+              if partes.scheme not in ('http', 'https') or not partes.hostname:
+                  raise SystemExit(f'URL de {nome} inválida. Use um endereço http ou https completo.')
 
-          echo "IMAGE_URL=$IMAGE_URL" >> "$GITHUB_ENV"
-          echo "ITEM=$ITEM" >> "$GITHUB_ENV"
-          echo "SAFE_ITEM=$SAFE_ITEM" >> "$GITHUB_ENV"
-          echo "CALLBACK=$CALLBACK" >> "$GITHUB_ENV"
+          seguro = re.sub(r'[^a-z0-9._-]', '-', item.lower())[:80].strip('.-') or 'produto'
 
-          echo "safe_item=$SAFE_ITEM" >> "$GITHUB_OUTPUT"
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as arquivo:
+              for chave, valor in [('IMAGE_URL', imagem), ('ITEM', item), ('SAFE_ITEM', seguro), ('CALLBACK', retorno)]:
+                  arquivo.write(f'{chave}={valor}\n')
 
-          echo "URL final: $IMAGE_URL"
-          echo "Item final: $ITEM"
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as arquivo:
+              arquivo.write(f'safe_item={seguro}\n')
+          PY
 
-      - name: Baixar imagem do produto
+      - name: Preparar FFmpeg
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Baixando: $IMAGE_URL"
-
-          curl -L --fail --retry 3 --retry-delay 2 \
-            --user-agent "Mozilla/5.0" \
-            "$IMAGE_URL" \
-            --output produto.jpg
-
-          test -s produto.jpg
-          file produto.jpg || true
-
-      - name: Verificar FFmpeg
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if ! command -v ffmpeg >/dev/null 2>&1; then
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
           fi
 
-          ffmpeg -version | head -n 1
+          ffmpeg -hide_banner -version
 
-      - name: Criar vídeo vertical
+      - name: Baixar e conferir imagem
         shell: bash
         run: |
           set -euo pipefail
 
-          ffmpeg -y \
-            -loop 1 -i produto.jpg \
-            -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-            -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p" \
-            -r 30 \
-            -t 8 \
-            -c:v libx264 \
+          curl --location --fail --silent --show-error \
+            --retry 3 --retry-delay 2 \
+            --connect-timeout 20 --max-time 120 \
+            --proto '=http,https' --proto-redir '=http,https' \
+            --user-agent 'Mozilla/5.0' \
+            --output produto.img \
+            --url "$IMAGE_URL"
+
+          test -s produto.img
+
+          MEDIDAS="$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=s=x:p=0 produto.img)"
+
+          if [[ ! "$MEDIDAS" =~ ^[0-9]+x[0-9]+$ ]]; then
+            echo '::error::O endereço não retornou uma imagem válida. Use a URL direta da imagem.'
+            exit 1
+          fi
+
+          echo "Resolução da imagem recebida: $MEDIDAS"
+          LARGURA="${MEDIDAS%x*}"
+          ALTURA="${MEDIDAS#*x}"
+
+          if (( LARGURA < 600 || ALTURA < 600 )); then
+            echo '::warning::Imagem pequena. Use a imagem original em maior resolução para melhorar a nitidez.'
+          fi
+
+      - name: Criar vídeo com zoom suave
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Uma única imagem gera 240 quadros com zoom progressivo.
+          # A imagem central inteira permanece dentro do enquadramento.
+          # O processamento em tamanho maior reduz os saltos do zoom.
+          FILTRO="[0:v]split=2[fundo][frente];"
+          FILTRO+="[fundo]scale=2160:3840:force_original_aspect_ratio=increase:flags=lanczos,crop=2160:3840,boxblur=40:2,setsar=1[bg];"
+          FILTRO+="[frente]scale=1800:3200:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,setsar=1[fg];"
+          FILTRO+="[bg][fg]overlay=(W-w)/2:(H-h)/2:format=auto,format=yuv444p,"
+          FILTRO+="zoompan=z='1+0.14*on/239':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=240:s=1080x1920:fps=30,format=yuv420p[v]"
+
+          ffmpeg -hide_banner -loglevel warning -nostdin -y \
+            -filter_complex_threads 2 \
+            -i produto.img \
+            -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
+            -filter_complex "$FILTRO" \
+            -map '[v]' -map 1:a:0 \
+            -t 8 -r 30 \
+            -c:v libx264 -preset medium -crf 18 -threads 2 \
             -pix_fmt yuv420p \
-            -c:a aac \
+            -c:a aac -b:a 128k -ar 48000 \
+            -movflags +faststart \
             -shortest \
             "video-${SAFE_ITEM}.mp4"
 
           test -s "video-${SAFE_ITEM}.mp4"
+
+      - name: Conferir vídeo gerado
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ffprobe -v error -count_frames -select_streams v:0 \
+            -show_entries stream=width,height,avg_frame_rate,nb_read_frames:format=duration \
+            -of json "video-${SAFE_ITEM}.mp4" > verificacao.json
+
+          python3 - <<'PY'
+          import json
+
+          with open('verificacao.json', encoding='utf-8') as arquivo:
+              dados = json.load(arquivo)
+
+          video = dados['streams'][0]
+          duracao = float(dados['format']['duration'])
+
+          if (video['width'], video['height']) != (1080, 1920):
+              raise SystemExit('Erro: resolução final diferente de 1080x1920.')
+          if video['avg_frame_rate'] != '30/1' or int(video['nb_read_frames']) != 240:
+              raise SystemExit('Erro: vídeo incompleto ou taxa de quadros incorreta.')
+          if not 7.9 <= duracao <= 8.2:
+              raise SystemExit('Erro: duração final incorreta.')
+
+          print('Vídeo conferido: 1080x1920, 30 fps, 240 quadros e 8 segundos.')
+          PY
 
       - name: Guardar vídeo de teste
         uses: actions/upload-artifact@v4
@@ -115,6 +173,7 @@ jobs:
           name: video-${{ steps.preparar.outputs.safe_item }}
           path: video-${{ steps.preparar.outputs.safe_item }}.mp4
           if-no-files-found: error
+          compression-level: 0
 
       - name: Enviar vídeo ao n8n
         if: ${{ env.CALLBACK != '' }}
@@ -122,11 +181,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl -L --fail \
-            -X POST "$CALLBACK" \
-            -F "item_id=$ITEM" \
-            -F "status=sucesso" \
-            -F "arquivo=@video-${SAFE_ITEM}.mp4;type=video/mp4"
+          curl --location --fail --silent --show-error \
+            --connect-timeout 20 --max-time 120 \
+            --proto '=http,https' --proto-redir '=http,https' \
+            --form-string "item_id=$ITEM" \
+            --form-string 'status=sucesso' \
+            --form "arquivo=@video-${SAFE_ITEM}.mp4;type=video/mp4" \
+            --output /dev/null \
+            --url "$CALLBACK"
 
-      - name: Complete job
+      - name: Concluir
         run: echo "Workflow concluído com sucesso."
